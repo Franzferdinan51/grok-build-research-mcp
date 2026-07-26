@@ -1,6 +1,6 @@
 {
   "name": "grok-build-research-mcp",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Read-only Grok Build research tools for LM Studio",
   "type": "module",
   "main": "index.js",

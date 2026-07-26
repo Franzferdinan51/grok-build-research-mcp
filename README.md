@@ -17,10 +17,10 @@ Read-only MCP tools for LM Studio backed by the installed Grok Build CLI.
 - `grok_model_query` — read-only queries through an approved model
 
 The wrapper exposes only Grok Build CLI's `web_search` and `web_fetch` tools.
-Normal, deep, and tool-free model queries default to the economical
-`grok-build` model alias. X search alone uses the faster
-`grok-4-20-non-reasoning` route so it stays inside MCP clients' common 60-second
-deadline. A read-only system override tells Grok to call built-in web tools
+Tool-free model queries and lightweight URL/data work default to the economical
+`grok-build` model alias. Search-heavy tools use the faster
+`grok-4-20-non-reasoning` route so they stay inside MCP clients' common
+60-second deadline. A read-only system override tells Grok to call built-in web tools
 directly instead of burning turns on MCP tool discovery. These routes are
 covered by live tests. It
 runs each request in a fresh temporary directory with subagents and Grok memory
@@ -55,6 +55,7 @@ Optional environment values:
 - `GROK_BUILD_MODEL`: tool-free model-query default; defaults to `grok-build`.
 - `GROK_BUILD_SEARCH_MODEL`: search-backed agent model; defaults to `grok-build`.
 - `GROK_BUILD_X_SEARCH_MODEL`: latency-sensitive X-search model; defaults to `grok-4-20-non-reasoning`.
+- `GROK_BUILD_FAST_RESEARCH_MODEL`: model for other deadline-sensitive research tools; defaults to `grok-4-20-non-reasoning`.
 - `GROK_WEB_SEARCH_MODEL`: Grok CLI's default server-side web-search model; set to `grok-build` in the LM Studio configuration and overridden by the dedicated X-search route.
 - `GROK_BUILD_TIMEOUT_MS`: hard timeout for each CLI process; defaults to `90000`.
 - `GROK_BUILD_MAX_CONCURRENT`: simultaneous request cap; defaults to `2` and is capped at `4`.

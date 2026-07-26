@@ -13,6 +13,7 @@ const grokBin = process.env.GROK_BUILD_BIN || 'grok';
 const model = process.env.GROK_BUILD_MODEL || 'grok-build';
 const searchModel = process.env.GROK_BUILD_SEARCH_MODEL || 'grok-build';
 const xSearchModel = process.env.GROK_BUILD_X_SEARCH_MODEL || 'grok-4-20-non-reasoning';
+const fastResearchModel = process.env.GROK_BUILD_FAST_RESEARCH_MODEL || 'grok-4-20-non-reasoning';
 const timeoutMs = Number.parseInt(process.env.GROK_BUILD_TIMEOUT_MS || '90000', 10);
 const maxConcurrent = Math.min(
   4,
@@ -31,7 +32,6 @@ const maxRateLimitUnits = Math.max(
   1,
   Number.parseInt(process.env.GROK_BUILD_RATE_LIMIT_MAX_UNITS || '12', 10),
 );
-const defaultDeepModel = process.env.GROK_BUILD_DEEP_MODEL || searchModel;
 const allowedModels = new Set(
   (process.env.GROK_BUILD_ALLOWED_MODELS
     || 'grok-build,grok-4.5,grok-4-20-multi-agent,grok-4-20-reasoning,grok-4-20-non-reasoning')
@@ -51,18 +51,52 @@ function cleanOutput(value) {
     .trim();
 }
 
+function firstJsonValue(value) {
+  const text = cleanOutput(value);
+  for (let start = 0; start < text.length; start += 1) {
+    if (!['[', '{'].includes(text[start])) continue;
+    const stack = [];
+    let inString = false;
+    let escaped = false;
+    for (let index = start; index < text.length; index += 1) {
+      const character = text[index];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (character === '\\') escaped = true;
+        else if (character === '"') inString = false;
+        continue;
+      }
+      if (character === '"') {
+        inString = true;
+      } else if (character === '[' || character === '{') {
+        stack.push(character);
+      } else if (character === ']' || character === '}') {
+        const opening = stack.pop();
+        if ((opening === '[' && character !== ']') || (opening === '{' && character !== '}')) break;
+        if (!stack.length) {
+          const candidate = text.slice(start, index + 1);
+          try {
+            return JSON.stringify(JSON.parse(candidate), null, 2);
+          } catch {
+            break;
+          }
+        }
+      }
+    }
+  }
+  return text;
+}
+
 async function runGrok(prompt, options = {}) {
   const isolatedCwd = await mkdtemp(join(tmpdir(), 'lmstudio-grok-research-'));
   const selectedModel = options.model || model;
   const maxTurns = Math.min(12, Math.max(1, options.maxTurns || 8));
-  const enabledTools = options.tools || 'web_search,web_fetch';
+  const enabledTools = options.tools === undefined ? 'web_search,web_fetch' : options.tools;
   const args = [
     '--cwd',
     isolatedCwd,
     '--single',
     prompt,
-    '--tools',
-    enabledTools,
     '--always-approve',
     '--no-subagents',
     '--no-memory',
@@ -78,6 +112,11 @@ async function runGrok(prompt, options = {}) {
       'Follow the requested tool-call limit, then produce the final answer without additional searches.',
     ].join(' '),
   ];
+  if (enabledTools) {
+    args.splice(4, 0, '--tools', enabledTools);
+  } else {
+    args.push('--disable-web-search');
+  }
   if (selectedModel) args.push('--model', selectedModel);
 
   try {
@@ -93,11 +132,12 @@ async function runGrok(prompt, options = {}) {
     });
     const output = cleanOutput(stdout);
     if (!output) throw new Error(cleanOutput(stderr) || 'Grok Build returned no output.');
-    return output;
+    return options.jsonOnly ? firstJsonValue(output) : output;
   } catch (error) {
     const partialOutput = cleanOutput(error.stdout);
     if (partialOutput) {
-      return `${partialOutput}\n\n[Stopped at the MCP latency limit; partial results returned instead of letting the host time out.]`;
+      const usableOutput = options.jsonOnly ? firstJsonValue(partialOutput) : partialOutput;
+      return `${usableOutput}\n\n[Stopped at the MCP latency limit; partial results returned instead of letting the host time out.]`;
     }
     throw error;
   } finally {
@@ -363,12 +403,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const depth = ['quick', 'standard', 'deep'].includes(args.depth) ? args.depth : 'standard';
     prompt = [
       `Research depth: ${depth}.`,
-      'Use current web search and fetch primary sources when possible.',
+      'Call web_search directly once. Prefer primary sources in the returned results.',
       'Answer in plain language, separate confirmed facts from uncertainty, and include direct source links.',
       optionalLine('Preferred sources', args.source_preferences),
       `Request: ${query}`,
     ].filter(Boolean).join('\n');
-    runOptions = { model: searchModel };
+    runOptions = {
+      model: fastResearchModel,
+      webSearchModel: fastResearchModel,
+      tools: 'web_search',
+      maxTurns: 3,
+      timeoutMs: 50000,
+    };
   } else if (request.params.name === 'grok_read_url') {
     const url = publicUrl(args.url);
     if (!url) {
@@ -379,7 +425,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       optionalLine('Focus', args.focus),
       'Summarize the page faithfully, identify the publisher and date when available, preserve important claims, and note anything that cannot be verified.',
     ].filter(Boolean).join('\n');
-    runOptions = { model: searchModel };
+    runOptions = { model: searchModel, tools: 'web_fetch', maxTurns: 4, timeoutMs: 50000 };
   } else if (request.params.name === 'grok_fact_check') {
     const claim = requiredText(args, 'claim');
     if (!claim) return { content: [{ type: 'text', text: 'claim is required.' }], isError: true };
@@ -388,14 +434,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       return { content: [{ type: 'text', text: 'source_url must be a public HTTP or HTTPS URL.' }], isError: true };
     }
     prompt = [
-      'Fact-check the claim below using current web search and primary sources whenever possible.',
+      'Call web_search directly once to fact-check the claim below, prioritizing primary sources.',
       'Return a verdict of Confirmed, Mostly true, Misleading, Unsupported, False, or Unresolved.',
-      'Explain the evidence, distinguish fact from inference, note important missing context, and include direct source links and dates.',
+      'Return a concise verdict with the strongest evidence, important missing context, dates, and no more than three direct source links.',
       optionalLine('Source URL', sourceUrl),
       optionalLine('Context', args.context),
       `Claim: ${claim}`,
     ].filter(Boolean).join('\n');
-    runOptions = { model: searchModel };
+    runOptions = {
+      model: fastResearchModel,
+      webSearchModel: fastResearchModel,
+      tools: 'web_search',
+      maxTurns: 3,
+      timeoutMs: 50000,
+    };
   } else if (request.params.name === 'grok_x_thread_reader') {
     const url = publicUrl(args.url);
     if (!url || !/^https?:\/\/(www\.)?(x|twitter)\.com\//i.test(url)) {
@@ -410,7 +462,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       optionalLine('Focus', args.focus),
       'State plainly when replies, quoted posts, or deleted content are inaccessible.',
     ].filter(Boolean).join('\n');
-    runOptions = { model: searchModel };
+    runOptions = {
+      model: fastResearchModel,
+      webSearchModel: fastResearchModel,
+      tools: 'web_fetch',
+      maxTurns: 5,
+      timeoutMs: 50000,
+    };
   } else if (request.params.name === 'grok_compare_sources') {
     const question = requiredText(args, 'question');
     const urls = publicUrls(args.urls);
@@ -425,19 +483,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       `Sources:\n${urls.map((url, index) => `${index + 1}. ${url}`).join('\n')}`,
       'Explain agreements, contradictions, evidence quality, publication dates, possible bias, and unresolved questions. Cite direct links throughout.',
     ].filter(Boolean).join('\n');
-    runOptions = { model: searchModel };
+    runOptions = {
+      model: fastResearchModel,
+      webSearchModel: fastResearchModel,
+      tools: 'web_fetch',
+      maxTurns: 6,
+      timeoutMs: 50000,
+    };
   } else if (request.params.name === 'grok_news_brief') {
     const topic = requiredText(args, 'topic');
     if (!topic) return { content: [{ type: 'text', text: 'topic is required.' }], isError: true };
     const length = ['short', 'standard', 'detailed'].includes(args.length) ? args.length : 'standard';
     prompt = [
-      `Create a ${length} current news brief using web search and primary sources where possible.`,
+      `Call web_search directly once, then create a ${length} current news brief using primary sources where possible.`,
       `Topic: ${topic}`,
       optionalLine('Timeframe', args.timeframe),
       optionalLine('Region', args.region),
       'Include: bottom line, timestamped timeline, key actors, confirmed facts, disputed claims, what to watch next, and direct source links.',
     ].filter(Boolean).join('\n');
-    runOptions = { model: searchModel };
+    runOptions = {
+      model: fastResearchModel,
+      webSearchModel: fastResearchModel,
+      tools: 'web_search',
+      maxTurns: 4,
+      timeoutMs: 50000,
+    };
   } else if (request.params.name === 'grok_extract_data') {
     const extractionRequest = requiredText(args, 'request');
     const fields = Array.isArray(args.fields)
@@ -456,24 +526,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       urls.length ? `Source URLs:\n${urls.join('\n')}` : '',
       'Return a JSON array of objects. Use null for unavailable values and include a source_url field for provenance.',
     ].filter(Boolean).join('\n');
-    runOptions = { model: searchModel };
+    runOptions = {
+      model: fastResearchModel,
+      webSearchModel: fastResearchModel,
+      maxTurns: 4,
+      timeoutMs: 50000,
+      jsonOnly: true,
+    };
   } else if (request.params.name === 'grok_find_sources') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
     const maxResults = Math.min(20, Math.max(1, Number.parseInt(args.max_results, 10) || 10));
     prompt = [
-      `Find up to ${maxResults} high-quality current sources for the request below.`,
+      `Call web_search directly once and find up to ${maxResults} high-quality current sources for the request below.`,
       'Prioritize primary, official, peer-reviewed, or direct reporting sources. Avoid duplicate syndication and low-quality aggregators.',
       optionalLine('Preferred source types', args.source_types),
       `Request: ${query}`,
       'Return a numbered list containing title, publisher, date, direct URL, source type, and one sentence explaining relevance. Do not write a general essay.',
     ].filter(Boolean).join('\n');
-    runOptions = { model: searchModel };
+    runOptions = {
+      model: fastResearchModel,
+      webSearchModel: fastResearchModel,
+      tools: 'web_search',
+      maxTurns: 4,
+      timeoutMs: 50000,
+    };
   } else if (request.params.name === 'grok_deep_research') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
     prompt = [
-      'Perform a deep research investigation using current web search and fetch.',
+      'Call web_search directly once, then perform an extended research synthesis from the returned evidence.',
       'Develop competing hypotheses, verify important claims against primary sources, resolve contradictions where possible, and cite direct links.',
       optionalLine('Preferred sources', args.source_preferences),
       optionalLine('Requested deliverable', args.deliverable),
@@ -481,7 +563,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       'Return an executive summary, evidence, counterevidence, uncertainties, conclusion, and recommended next checks.',
     ].filter(Boolean).join('\n');
     isDeep = true;
-    runOptions = { model: defaultDeepModel, maxTurns: 10 };
+    runOptions = {
+      model: fastResearchModel,
+      webSearchModel: fastResearchModel,
+      tools: 'web_search',
+      maxTurns: 5,
+      timeoutMs: 50000,
+    };
   } else if (request.params.name === 'grok_model_query') {
     const userPrompt = requiredText(args, 'prompt');
     if (!userPrompt) return { content: [{ type: 'text', text: 'prompt is required.' }], isError: true };
@@ -497,12 +585,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     }
     const maxTurns = Math.min(8, Math.max(1, Number.parseInt(args.max_turns, 10) || 6));
     prompt = [
-      'Answer the request using only read-only web search and fetch tools.',
-      'Include direct source links for factual claims and distinguish uncertainty.',
+      'Answer the request directly without calling tools.',
+      'Be concise and distinguish uncertainty when relevant.',
       `Request: ${userPrompt}`,
     ].join('\n');
     isDeep = selectedModel.includes('multi-agent');
-    runOptions = { model: selectedModel, maxTurns };
+    runOptions = { model: selectedModel, tools: '', maxTurns: Math.min(maxTurns, 3), timeoutMs: 50000 };
   } else {
     return { content: [{ type: 'text', text: `Unknown tool: ${request.params.name}` }], isError: true };
   }
