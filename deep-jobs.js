@@ -76,8 +76,12 @@ function processIsAlive(pid) {
 }
 
 function publicJob(job, includeResult = false) {
-  const liveElapsed = activeStatuses.has(job.status) && job.startedAt
-    ? Date.now() - Date.parse(job.startedAt)
+  const startedMs = Date.parse(job.startedAt || '');
+  const endedMs = activeStatuses.has(job.status)
+    ? Date.now()
+    : Date.parse(job.completedAt || '');
+  const wallElapsed = Number.isFinite(startedMs) && Number.isFinite(endedMs)
+    ? Math.max(0, endedMs - startedMs)
     : 0;
   const output = {
     job_id: job.jobId,
@@ -93,7 +97,7 @@ function publicJob(job, includeResult = false) {
     phases: job.phases ?? [],
     agents_used: job.agentsUsed ?? 0,
     agent_budget: job.agentBudget ?? null,
-    elapsed_ms: Math.max(job.elapsedMs ?? 0, liveElapsed),
+    elapsed_ms: Math.max(job.elapsedMs ?? 0, wallElapsed),
     error: job.error ?? null,
   };
   if (includeResult) output.result = job.result ?? null;

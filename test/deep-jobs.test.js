@@ -62,6 +62,7 @@ test('native jobs persist progress and results outside an MCP request', async ()
     assert.equal(dashboard.length, 1);
     assert.equal(dashboard[0].ready, true);
     assert.equal(dashboard[0].result_available, true);
+    assert.ok(dashboard[0].elapsed_ms > 0);
     const activeOnly = await listNativeDeepWorkflows({
       directory,
       includeCompleted: false,

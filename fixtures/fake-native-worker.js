@@ -33,6 +33,7 @@ process.once('SIGTERM', async () => {
 await persist({
   status: 'running',
   workerPid: process.pid,
+  startedAt: new Date().toISOString(),
   workflowName: 'deep-research',
   workflowRunId: 'wf_fake',
   currentPhase: 'Research',

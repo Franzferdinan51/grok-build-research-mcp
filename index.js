@@ -434,7 +434,7 @@ const tools = [
 ];
 
 const server = new Server(
-  { name: 'grok-build-research', version: '1.4.0' },
+  { name: 'grok-build-research', version: '1.4.1' },
   { capabilities: { tools: {} } },
 );
 
