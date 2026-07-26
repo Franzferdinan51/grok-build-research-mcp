@@ -2,10 +2,23 @@
 import { readFile, rename, writeFile } from 'node:fs/promises';
 
 const path = process.argv[2];
+const launchToken = process.argv[3];
 
 async function awaitLaunchRegistration() {
   for (let attempt = 0; attempt < 250; attempt += 1) {
     const candidate = JSON.parse(await readFile(path, 'utf8'));
+    if (candidate.launchToken !== launchToken) {
+      throw new Error('Fake worker launch token did not match.');
+    }
+    if (candidate.status === 'queued') {
+      candidate.workerPid = process.pid;
+      candidate.status = 'launching';
+      candidate.updatedAt = new Date().toISOString();
+      const temporary = `${path}.register-${process.pid}`;
+      await writeFile(temporary, `${JSON.stringify(candidate)}\n`);
+      await rename(temporary, path);
+      return candidate;
+    }
     if (candidate.workerPid === process.pid) return candidate;
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
@@ -43,6 +56,8 @@ await persist({
 
 const completionDelay = job.query.includes('cancel')
   ? 5000
+  : job.query.includes('survive')
+    ? 1200
   : job.query.includes('instant')
     ? 0
     : 300;

@@ -1,12 +1,12 @@
 {
   "name": "grok-build-research-mcp",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Read-only Grok Build research tools for LM Studio",
   "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "check": "node --check index.js && node --check deep-jobs.js && node --check native-deep-worker.js",
+    "check": "node --check index.js && node --check deep-jobs.js && node --check native-deep-worker.js && node --check fixtures/launch-and-exit.js",
     "test": "node --test"
   },
   "private": true,

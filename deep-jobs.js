@@ -1,7 +1,15 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
-import { chmod, mkdir, readFile, readdir, rename, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
+import {
+  chmod,
+  mkdir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  writeFile,
+} from 'node:fs/promises';
+import { homedir, tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -75,6 +83,139 @@ function processIsAlive(pid) {
   }
 }
 
+async function cleanupJobWorkspace(job) {
+  const root = resolve(tmpdir());
+  const targets = [
+    ['isolatedCwd', `lmstudio-native-deep-${job.jobId}-`],
+    ['isolatedGrokHome', `lmstudio-native-grok-home-${job.jobId}-`],
+  ];
+  for (const [fieldName, expectedPrefix] of targets) {
+    if (typeof job[fieldName] !== 'string') continue;
+    const candidate = resolve(job[fieldName]);
+    const traversal = relative(root, candidate);
+    if (
+      traversal.startsWith('..')
+      || isAbsolute(traversal)
+      || traversal.includes('/')
+      || !traversal.startsWith(expectedPrefix)
+    ) {
+      continue;
+    }
+    await rm(candidate, { recursive: true, force: true });
+  }
+}
+
+async function waitForExit(child) {
+  let stderr = '';
+  child.stderr?.on('data', (chunk) => {
+    stderr = `${stderr}${chunk}`.slice(-8000);
+  });
+  const result = await new Promise((resolveExit, rejectExit) => {
+    child.once('error', rejectExit);
+    child.once('exit', (code, signal) => resolveExit({ code, signal }));
+  });
+  if (result.code !== 0) {
+    throw new Error(
+      `Worker launcher exited with ${result.signal || result.code}: ${stderr.trim()}`,
+    );
+  }
+}
+
+async function waitForWorkerRegistration(path, launchToken, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const candidate = JSON.parse(await readFile(path, 'utf8'));
+    if (candidate.launchToken !== launchToken) {
+      throw new Error('Native worker registration token changed unexpectedly.');
+    }
+    if (
+      Number.isSafeInteger(candidate.workerPid)
+      && candidate.workerPid > 0
+      && (processIsAlive(candidate.workerPid) || terminalStatuses.has(candidate.status))
+    ) {
+      return candidate;
+    }
+    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+  }
+  throw new Error('Native worker did not register within five seconds.');
+}
+
+function defaultLaunchMode(workerPath) {
+  if (process.env.GROK_BUILD_NATIVE_LAUNCHER) {
+    return process.env.GROK_BUILD_NATIVE_LAUNCHER;
+  }
+  return process.platform === 'darwin' && workerPath === defaultWorker
+    ? 'launchd'
+    : 'detached';
+}
+
+async function launchDetachedWorker({ workerPath, path, launchToken }) {
+  const child = spawn(
+    process.execPath,
+    [workerPath, path, launchToken],
+    {
+      cwd: __dirname,
+      detached: true,
+      stdio: 'ignore',
+      env: {
+        ...process.env,
+        GROK_MEMORY: '0',
+        GROK_WORKFLOWS: '1',
+      },
+    },
+  );
+  child.unref();
+}
+
+async function launchWithLaunchd({
+  workerPath,
+  path,
+  launchToken,
+  launchLabel,
+  workerLogPath,
+}) {
+  await writeFile(workerLogPath, '', { mode: 0o600 });
+  await chmod(workerLogPath, 0o600);
+  const wrapper = [
+    '"$1" "$2" "$3" "$4"',
+    'code=$?',
+    '/bin/launchctl remove "$5" >/dev/null 2>&1',
+    'exit "$code"',
+  ].join('; ');
+  const child = spawn(
+    '/bin/launchctl',
+    [
+      'submit',
+      '-l',
+      launchLabel,
+      '-o',
+      workerLogPath,
+      '-e',
+      workerLogPath,
+      '--',
+      '/bin/sh',
+      '-c',
+      wrapper,
+      'grok-native-worker-wrapper',
+      process.execPath,
+      workerPath,
+      path,
+      launchToken,
+      launchLabel,
+    ],
+    {
+      cwd: __dirname,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: {
+        ...process.env,
+        GROK_MEMORY: '0',
+        GROK_WORKFLOWS: '1',
+      },
+    },
+  );
+  await waitForExit(child);
+}
+
 function publicJob(job, includeResult = false) {
   const startedMs = Date.parse(job.startedAt || '');
   const endedMs = activeStatuses.has(job.status)
@@ -99,6 +240,7 @@ function publicJob(job, includeResult = false) {
     agent_budget: job.agentBudget ?? null,
     elapsed_ms: Math.max(job.elapsedMs ?? 0, wallElapsed),
     error: job.error ?? null,
+    launch_mode: job.launchMode ?? null,
   };
   if (includeResult) output.result = job.result ?? null;
   return output;
@@ -143,6 +285,7 @@ export async function startNativeDeepJob({
   grokBin = 'grok',
   directory = nativeJobDirectory(),
   workerPath = process.env.GROK_BUILD_NATIVE_WORKER || defaultWorker,
+  launchMode,
   maxRuntimeMs = Number.parseInt(
     process.env.GROK_BUILD_NATIVE_MAX_RUNTIME_MS || '1800000',
     10,
@@ -168,11 +311,24 @@ export async function startNativeDeepJob({
       job.updatedAt = new Date().toISOString();
       job.completedAt = job.updatedAt;
       await atomicWrite(jobPath(job.jobId, directory), job);
+      await cleanupJobWorkspace(job);
     }
 
     const now = new Date().toISOString();
     const jobId = `dr_${Date.now().toString(36)}_${randomBytes(4).toString('hex')}`;
     const path = jobPath(jobId, directory);
+    const resolvedLaunchMode = launchMode || defaultLaunchMode(workerPath);
+    if (!['launchd', 'detached'].includes(resolvedLaunchMode)) {
+      throw new Error('GROK_BUILD_NATIVE_LAUNCHER must be launchd or detached.');
+    }
+    if (resolvedLaunchMode === 'launchd' && process.platform !== 'darwin') {
+      throw new Error('The launchd worker mode is only available on macOS.');
+    }
+    const launchToken = randomBytes(16).toString('hex');
+    const launchLabel = resolvedLaunchMode === 'launchd'
+      ? `com.duckbot.grok-build-research.${jobId.replaceAll('_', '-')}`
+      : null;
+    const workerLogPath = join(directory, `${jobId}.worker.log`);
     const job = {
       schemaVersion: 1,
       jobId,
@@ -185,6 +341,10 @@ export async function startNativeDeepJob({
       model,
       grokBin,
       maxRuntimeMs,
+      launchMode: resolvedLaunchMode,
+      launchToken,
+      launchLabel,
+      workerLogPath,
       createdAt: now,
       updatedAt: now,
       result: null,
@@ -192,26 +352,35 @@ export async function startNativeDeepJob({
     };
     await atomicWrite(path, job);
 
-    const child = spawn(process.execPath, [workerPath, path], {
-      cwd: __dirname,
-      detached: true,
-      stdio: 'ignore',
-      env: {
-        ...process.env,
-        GROK_MEMORY: '0',
-        GROK_WORKFLOWS: '1',
-      },
-    });
-    child.unref();
-
-    // The worker waits for this registration before it writes any state. This
-    // prevents a fast worker from completing and then being overwritten by the
-    // parent's stale queued snapshot.
-    job.workerPid = child.pid;
-    job.status = 'launching';
-    job.updatedAt = new Date().toISOString();
-    await atomicWrite(path, job);
-    return publicJob(job);
+    try {
+      if (resolvedLaunchMode === 'launchd') {
+        await launchWithLaunchd({
+          workerPath,
+          path,
+          launchToken,
+          launchLabel,
+          workerLogPath,
+        });
+      } else {
+        await launchDetachedWorker({ workerPath, path, launchToken });
+      }
+      const registered = await waitForWorkerRegistration(path, launchToken);
+      return publicJob(registered);
+    } catch (error) {
+      if (launchLabel) {
+        const cleanup = spawn('/bin/launchctl', ['remove', launchLabel], {
+          stdio: 'ignore',
+        });
+        cleanup.unref();
+      }
+      const failed = JSON.parse(await readFile(path, 'utf8'));
+      failed.status = 'failed';
+      failed.error = `Native worker launch failed: ${error.message}`;
+      failed.updatedAt = new Date().toISOString();
+      failed.completedAt = failed.updatedAt;
+      await atomicWrite(path, failed);
+      throw error;
+    }
   } finally {
     startInProgress = false;
   }
@@ -225,6 +394,7 @@ export async function nativeDeepJobStatus(jobId, directory = nativeJobDirectory(
     job.updatedAt = new Date().toISOString();
     job.completedAt = job.updatedAt;
     await atomicWrite(jobPath(jobId, directory), job);
+    await cleanupJobWorkspace(job);
   }
   return publicJob(job);
 }
@@ -292,6 +462,7 @@ export async function cancelNativeDeepJob(jobId, directory = nativeJobDirectory(
   latest.completedAt = new Date().toISOString();
   latest.updatedAt = latest.completedAt;
   await atomicWrite(jobPath(jobId, directory), latest);
+  await cleanupJobWorkspace(latest);
   return publicJob(latest);
 }
 

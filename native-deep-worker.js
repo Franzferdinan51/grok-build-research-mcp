@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import {
+  appendFile,
   chmod,
   copyFile,
   mkdir,
@@ -18,10 +19,30 @@ import * as acp from '@agentclientprotocol/sdk';
 
 const jobPath = process.argv[2];
 if (!jobPath) throw new Error('native-deep-worker requires a job-state path.');
+const launchToken = process.argv[3];
+if (!launchToken) throw new Error('native-deep-worker requires a launch token.');
 
 async function awaitLaunchRegistration() {
   for (let attempt = 0; attempt < 250; attempt += 1) {
     const candidate = JSON.parse(await readFile(jobPath, 'utf8'));
+    if (candidate.launchToken !== launchToken) {
+      throw new Error('The native deep-research launch token did not match.');
+    }
+    if (
+      candidate.status === 'queued'
+      || (
+        candidate.status === 'launching'
+        && (!candidate.workerPid || candidate.workerPid === process.pid)
+      )
+    ) {
+      candidate.workerPid = process.pid;
+      candidate.status = 'launching';
+      candidate.updatedAt = new Date().toISOString();
+      const temporary = `${jobPath}.register-${process.pid}-${Date.now()}`;
+      await writeFile(temporary, `${JSON.stringify(candidate, null, 2)}\n`, { mode: 0o600 });
+      await rename(temporary, jobPath);
+      return candidate;
+    }
     if (candidate.workerPid === process.pid) return candidate;
     await new Promise((resolveWait) => setTimeout(resolveWait, 20));
   }
@@ -44,6 +65,19 @@ const workflowTerminalPromise = new Promise((resolve, reject) => {
 
 function timestamp() {
   return new Date().toISOString();
+}
+
+async function logDiagnostic(event, detail = '') {
+  if (!job.workerLogPath) return;
+  try {
+    await appendFile(
+      job.workerLogPath,
+      `${timestamp()} ${event}${detail ? ` ${detail}` : ''}\n`,
+      { mode: 0o600 },
+    );
+  } catch {
+    // Diagnostics must never break the research workflow.
+  }
 }
 
 function atomicPersist() {
@@ -214,6 +248,7 @@ async function cancelWorkflow() {
     'budget_limited',
   ]);
   if (workflowTerminal || terminalStatuses.has(job.status)) {
+    await logDiagnostic('worker-stopping', `terminal-status=${job.status}`);
     await stopProcesses();
     if (job.isolatedCwd) await rm(job.isolatedCwd, { recursive: true, force: true });
     if (job.isolatedGrokHome) {
@@ -237,6 +272,7 @@ async function cancelWorkflow() {
     error: null,
     completedAt: timestamp(),
   });
+  await logDiagnostic('worker-cancelled');
   await stopProcesses();
   if (job.isolatedCwd) {
     await rm(job.isolatedCwd, { recursive: true, force: true });
@@ -251,6 +287,10 @@ process.once('SIGTERM', () => void cancelWorkflow());
 process.once('SIGINT', () => void cancelWorkflow());
 
 async function main() {
+  await logDiagnostic(
+    'worker-started',
+    `pid=${process.pid} launch-mode=${job.launchMode || 'unknown'}`,
+  );
   const isolatedCwd = join(
     tmpdir(),
     `lmstudio-native-deep-${job.jobId}-${process.pid}`,
@@ -302,6 +342,10 @@ async function main() {
     stderr = `${stderr}${chunk}`.slice(-16000);
   });
   grokProcess.once('exit', (code, signal) => {
+    void logDiagnostic(
+      'grok-acp-exited',
+      `code=${code ?? 'none'} signal=${signal || 'none'}`,
+    );
     if (!workflowTerminal && !shuttingDown) {
       workflowTerminalReject(
         new Error(`Grok ACP process exited before completion (${signal || code}). ${stderr.trim()}`),
@@ -396,6 +440,7 @@ async function main() {
     workflowTerminalPromise,
     runtimeTimeout,
   ]);
+  await logDiagnostic('workflow-terminal', `status=${job.status}`);
   await stateMonitor;
   await writeChain;
   await stopProcesses();
@@ -406,6 +451,7 @@ async function main() {
 try {
   await main();
 } catch (error) {
+  await logDiagnostic('worker-error', error.stack || error.message);
   if (!shuttingDown) {
     await updateJob({
       status: 'failed',

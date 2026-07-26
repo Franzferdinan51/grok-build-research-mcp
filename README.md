@@ -53,11 +53,18 @@ through ACP and returns a persistent job ID immediately. The native workflow
 plans independent questions, researches them in parallel, verifies candidate
 claims on separate shards, validates citations, and writes a final report.
 
-Each job runs in a detached worker rather than inside the original MCP request.
+On macOS, each production job runs as a transient `launchd` service rather
+than as a child of the original MCP request. This is important because LM
+Studio may reload its MCP plugin processes between turns; a launchd-owned
+worker survives that reload and removes its transient service after the job
+finishes. Other platforms use a detached worker process.
 LM Studio therefore never holds a tool call open while research runs. The
 status, result, and cancel tools only read or update small local job-state
 files, so they return quickly and continue working after a chat change or MCP
 restart. Only one native workflow is admitted at a time.
+Each job also keeps a mode-`0600` worker diagnostic log beside its persistent
+state file, so an unexpected process exit retains the real failure reason
+instead of collapsing into a generic interruption message.
 
 Typical flow:
 
@@ -114,6 +121,8 @@ Optional environment values:
 - `GROK_BUILD_NATIVE_DEEP_MODEL`: parent model used by native Deep Research; defaults to `grok-build`.
 - `GROK_BUILD_NATIVE_DEEP_RATE_COST`: request units charged for a native workflow; defaults to `6`.
 - `GROK_BUILD_NATIVE_MAX_RUNTIME_MS`: native workflow ceiling; defaults to 30 minutes.
+- `GROK_BUILD_NATIVE_LAUNCHER`: `launchd` or `detached`; defaults to `launchd`
+  for the production worker on macOS and `detached` elsewhere.
 - `GROK_BUILD_JOB_DIR`: persistent job-state directory; defaults to `~/.grok-build-research-mcp/jobs`.
 - `GROK_BUILD_ALLOWED_MODELS`: comma-separated allowlist for `grok_model_query`.
 
