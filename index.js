@@ -7,6 +7,12 @@ import { promisify } from 'node:util';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  cancelNativeDeepJob,
+  nativeDeepJobResult,
+  nativeDeepJobStatus,
+  startNativeDeepJob,
+} from './deep-jobs.js';
 
 const execFileAsync = promisify(execFile);
 const grokBin = process.env.GROK_BUILD_BIN || 'grok';
@@ -333,8 +339,8 @@ const tools = [
     },
   },
   {
-    name: 'grok_deep_research',
-    description: 'Run a slower, one-at-a-time deep research pass with a larger turn budget, primary sources, and a structured synthesis.',
+    name: 'grok_quick_deep_research',
+    description: 'Run the original synchronous deep-research pass. It returns during the current MCP call and is capped to fit LM Studio latency limits.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -343,6 +349,53 @@ const tools = [
         deliverable: { type: 'string', description: 'Optional requested output format or decision to support.' },
       },
       required: ['query'],
+    },
+  },
+  {
+    name: 'grok_deep_research',
+    description: 'Start xAI Grok Build’s native verified Deep Research as a background job and immediately return a job ID. Do not poll it in the same assistant turn; give the job ID to the user, then use the status and result tools in a later turn.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Complex research question.' },
+        breadth: { type: 'integer', minimum: 2, maximum: 6, description: 'Independent research-question breadth. Default: 4.' },
+        source_preferences: { type: 'string', description: 'Optional preferred sources or domains.' },
+        deliverable: { type: 'string', description: 'Optional requested output format or decision to support.' },
+      },
+      required: ['query'],
+    },
+  },
+  {
+    name: 'grok_deep_research_status',
+    description: 'Check a native Deep Research background job. Returns its phase, workflow status, agent usage, and elapsed time immediately.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'Job ID returned by grok_deep_research.' },
+      },
+      required: ['job_id'],
+    },
+  },
+  {
+    name: 'grok_deep_research_result',
+    description: 'Retrieve the final native Deep Research report when ready. If still running, returns ready=false and current progress without blocking.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'Job ID returned by grok_deep_research.' },
+      },
+      required: ['job_id'],
+    },
+  },
+  {
+    name: 'grok_deep_research_cancel',
+    description: 'Cancel a running native Deep Research background job and its Grok workflow.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'Job ID returned by grok_deep_research.' },
+      },
+      required: ['job_id'],
     },
   },
   {
@@ -364,7 +417,7 @@ const tools = [
 ];
 
 const server = new Server(
-  { name: 'grok-build-research', version: '1.0.0' },
+  { name: 'grok-build-research', version: '1.3.0' },
   { capabilities: { tools: {} } },
 );
 
@@ -372,11 +425,128 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const args = request.params.arguments || {};
+  const toolName = request.params.name;
   let prompt;
   let runOptions = {};
   let isDeep = false;
 
-  if (request.params.name === 'grok_x_search') {
+  if (toolName === 'grok_deep_research') {
+    const query = requiredText(args, 'query');
+    if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
+    if (query.length > 20_000) {
+      return {
+        content: [{ type: 'text', text: 'query must be 20,000 characters or fewer.' }],
+        isError: true,
+      };
+    }
+    const sourcePreferences = requiredText(args, 'source_preferences');
+    const deliverable = requiredText(args, 'deliverable');
+    if (sourcePreferences.length > 4_000 || deliverable.length > 4_000) {
+      return {
+        content: [{
+          type: 'text',
+          text: 'source_preferences and deliverable must each be 4,000 characters or fewer.',
+        }],
+        isError: true,
+      };
+    }
+    const breadth = Math.min(6, Math.max(2, Number.parseInt(args.breadth, 10) || 4));
+    const nativeRateCost = Math.max(
+      3,
+      Number.parseInt(process.env.GROK_BUILD_NATIVE_DEEP_RATE_COST || '6', 10),
+    );
+    const now = Date.now();
+    const retryAfterMs = rateLimitRetryAfter(now, nativeRateCost);
+    if (retryAfterMs > 0) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Grok Build rate protection rejected the native workflow before launch. Retry after ${Math.ceil(retryAfterMs / 1000)} seconds.`,
+        }],
+        isError: true,
+      };
+    }
+    try {
+      const job = await startNativeDeepJob({
+        query,
+        breadth,
+        sourcePreferences,
+        deliverable,
+        model: process.env.GROK_BUILD_NATIVE_DEEP_MODEL || 'grok-build',
+        grokBin,
+      });
+      recordRunStart(now, nativeRateCost);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ...job,
+            ready: false,
+            next_check_after_seconds: 30,
+            instruction: `Do not poll in this assistant turn. Return job_id ${job.job_id} to the user. In a later turn, call grok_deep_research_status and then grok_deep_research_result when ready.`,
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      return {
+        content: [{ type: 'text', text: `Native Deep Research was not started: ${error.message}` }],
+        isError: true,
+      };
+    }
+  }
+
+  if (toolName === 'grok_deep_research_status') {
+    try {
+      const job = await nativeDeepJobStatus(requiredText(args, 'job_id'));
+      const ready = !['queued', 'launching', 'running', 'cancelling'].includes(job.status);
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ...job,
+            ready,
+            ...(ready ? {} : {
+              next_check_after_seconds: 30,
+              instruction: 'Do not poll again in this assistant turn. Report the current phase and check again only after a later user request.',
+            }),
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: 'text', text: error.message }], isError: true };
+    }
+  }
+
+  if (toolName === 'grok_deep_research_result') {
+    try {
+      const job = await nativeDeepJobResult(requiredText(args, 'job_id'));
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            ...job,
+            ...(job.ready ? {} : {
+              next_check_after_seconds: 30,
+              instruction: 'The report is not ready. Do not poll again in this assistant turn.',
+            }),
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: 'text', text: error.message }], isError: true };
+    }
+  }
+
+  if (toolName === 'grok_deep_research_cancel') {
+    try {
+      const job = await cancelNativeDeepJob(requiredText(args, 'job_id'));
+      return { content: [{ type: 'text', text: JSON.stringify(job, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: error.message }], isError: true };
+    }
+  }
+
+  if (toolName === 'grok_x_search') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
     const maxResults = Math.min(10, Math.max(1, Number.parseInt(args.max_results, 10) || 3));
@@ -397,7 +567,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       maxTurns: 4,
       timeoutMs: 50000,
     };
-  } else if (request.params.name === 'grok_web_research') {
+  } else if (toolName === 'grok_web_research') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
     const depth = ['quick', 'standard', 'deep'].includes(args.depth) ? args.depth : 'standard';
@@ -415,7 +585,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       maxTurns: 3,
       timeoutMs: 50000,
     };
-  } else if (request.params.name === 'grok_read_url') {
+  } else if (toolName === 'grok_read_url') {
     const url = publicUrl(args.url);
     if (!url) {
       return { content: [{ type: 'text', text: 'A public HTTP or HTTPS URL is required.' }], isError: true };
@@ -426,7 +596,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       'Summarize the page faithfully, identify the publisher and date when available, preserve important claims, and note anything that cannot be verified.',
     ].filter(Boolean).join('\n');
     runOptions = { model: searchModel, tools: 'web_fetch', maxTurns: 4, timeoutMs: 50000 };
-  } else if (request.params.name === 'grok_fact_check') {
+  } else if (toolName === 'grok_fact_check') {
     const claim = requiredText(args, 'claim');
     if (!claim) return { content: [{ type: 'text', text: 'claim is required.' }], isError: true };
     const sourceUrl = args.source_url ? publicUrl(args.source_url) : '';
@@ -448,7 +618,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       maxTurns: 3,
       timeoutMs: 50000,
     };
-  } else if (request.params.name === 'grok_x_thread_reader') {
+  } else if (toolName === 'grok_x_thread_reader') {
     const url = publicUrl(args.url);
     if (!url || !/^https?:\/\/(www\.)?(x|twitter)\.com\//i.test(url)) {
       return { content: [{ type: 'text', text: 'A public x.com or twitter.com URL is required.' }], isError: true };
@@ -469,7 +639,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       maxTurns: 5,
       timeoutMs: 50000,
     };
-  } else if (request.params.name === 'grok_compare_sources') {
+  } else if (toolName === 'grok_compare_sources') {
     const question = requiredText(args, 'question');
     const urls = publicUrls(args.urls);
     if (!question) return { content: [{ type: 'text', text: 'question is required.' }], isError: true };
@@ -490,7 +660,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       maxTurns: 6,
       timeoutMs: 50000,
     };
-  } else if (request.params.name === 'grok_news_brief') {
+  } else if (toolName === 'grok_news_brief') {
     const topic = requiredText(args, 'topic');
     if (!topic) return { content: [{ type: 'text', text: 'topic is required.' }], isError: true };
     const length = ['short', 'standard', 'detailed'].includes(args.length) ? args.length : 'standard';
@@ -508,7 +678,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       maxTurns: 4,
       timeoutMs: 50000,
     };
-  } else if (request.params.name === 'grok_extract_data') {
+  } else if (toolName === 'grok_extract_data') {
     const extractionRequest = requiredText(args, 'request');
     const fields = Array.isArray(args.fields)
       ? args.fields.map((value) => String(value).trim()).filter(Boolean).slice(0, 30)
@@ -533,7 +703,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       timeoutMs: 50000,
       jsonOnly: true,
     };
-  } else if (request.params.name === 'grok_find_sources') {
+  } else if (toolName === 'grok_find_sources') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
     const maxResults = Math.min(20, Math.max(1, Number.parseInt(args.max_results, 10) || 10));
@@ -551,7 +721,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       maxTurns: 4,
       timeoutMs: 50000,
     };
-  } else if (request.params.name === 'grok_deep_research') {
+  } else if (toolName === 'grok_quick_deep_research') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
     prompt = [
@@ -570,7 +740,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       maxTurns: 5,
       timeoutMs: 50000,
     };
-  } else if (request.params.name === 'grok_model_query') {
+  } else if (toolName === 'grok_model_query') {
     const userPrompt = requiredText(args, 'prompt');
     if (!userPrompt) return { content: [{ type: 'text', text: 'prompt is required.' }], isError: true };
     const selectedModel = requiredText(args, 'model') || model || 'grok-build';
@@ -592,7 +762,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     isDeep = selectedModel.includes('multi-agent');
     runOptions = { model: selectedModel, tools: '', maxTurns: Math.min(maxTurns, 3), timeoutMs: 50000 };
   } else {
-    return { content: [{ type: 'text', text: `Unknown tool: ${request.params.name}` }], isError: true };
+    return { content: [{ type: 'text', text: `Unknown tool: ${toolName}` }], isError: true };
   }
 
   if (activeRuns >= maxConcurrent) {

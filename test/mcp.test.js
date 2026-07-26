@@ -58,7 +58,11 @@ test('lists the complete read-only research tool set', async () => {
     'grok_news_brief',
     'grok_extract_data',
     'grok_find_sources',
+    'grok_quick_deep_research',
     'grok_deep_research',
+    'grok_deep_research_status',
+    'grok_deep_research_result',
+    'grok_deep_research_cancel',
     'grok_model_query',
   ]);
 });
@@ -71,7 +75,7 @@ test('runs each new tool through the isolated Grok wrapper', async () => {
     ['grok_news_brief', { topic: 'Example news' }],
     ['grok_extract_data', { request: 'Extract examples', fields: ['name'] }],
     ['grok_find_sources', { query: 'Example sources' }],
-    ['grok_deep_research', { query: 'Research examples deeply' }],
+    ['grok_quick_deep_research', { query: 'Research examples deeply' }],
     ['grok_model_query', { prompt: 'Research examples', model: 'grok-build' }],
   ];
 
@@ -113,11 +117,11 @@ test('routes X search to the fast model and tool-free queries to Grok Build', as
 
 test('allows only one deep or multi-agent request at a time', async () => {
   const first = client.callTool({
-    name: 'grok_deep_research',
+    name: 'grok_quick_deep_research',
     arguments: { query: 'first deep request' },
   });
   const second = client.callTool({
-    name: 'grok_deep_research',
+    name: 'grok_quick_deep_research',
     arguments: { query: 'second deep request' },
   });
 
