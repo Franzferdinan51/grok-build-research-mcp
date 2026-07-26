@@ -10,7 +10,7 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 
 const execFileAsync = promisify(execFile);
 const grokBin = process.env.GROK_BUILD_BIN || 'grok';
-const model = process.env.GROK_BUILD_MODEL || '';
+const model = process.env.GROK_BUILD_MODEL || 'grok-build';
 const timeoutMs = Number.parseInt(process.env.GROK_BUILD_TIMEOUT_MS || '120000', 10);
 const maxConcurrent = Math.min(
   4,
