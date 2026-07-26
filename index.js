@@ -9,6 +9,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import {
   cancelNativeDeepJob,
+  listNativeDeepWorkflows,
   nativeDeepJobResult,
   nativeDeepJobStatus,
   startNativeDeepJob,
@@ -339,6 +340,22 @@ const tools = [
     },
   },
   {
+    name: 'grok_workflows',
+    description: 'LM Studio-friendly equivalent of Grok Build’s /workflows dashboard. Immediately lists active and retained native workflow runs with phase, agent usage, readiness, and the job ID needed to retrieve a full result.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        include_completed: { type: 'boolean', description: 'Include retained terminal runs. Default: true.' },
+        status: {
+          type: 'string',
+          enum: ['queued', 'launching', 'running', 'cancelling', 'completed', 'failed', 'cancelled', 'interrupted', 'paused', 'budget_limited'],
+          description: 'Optional exact status filter.',
+        },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: 'Maximum newest runs to return. Default: 20.' },
+      },
+    },
+  },
+  {
     name: 'grok_quick_deep_research',
     description: 'Run the original synchronous deep-research pass. It returns during the current MCP call and is capped to fit LM Studio latency limits.',
     inputSchema: {
@@ -417,7 +434,7 @@ const tools = [
 ];
 
 const server = new Server(
-  { name: 'grok-build-research', version: '1.3.0' },
+  { name: 'grok-build-research', version: '1.4.0' },
   { capabilities: { tools: {} } },
 );
 
@@ -429,6 +446,36 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   let prompt;
   let runOptions = {};
   let isDeep = false;
+
+  if (toolName === 'grok_workflows') {
+    try {
+      const includeCompleted = args.include_completed !== false;
+      const limit = Math.min(100, Math.max(1, Number.parseInt(args.limit, 10) || 20));
+      const status = typeof args.status === 'string' ? args.status : '';
+      const workflows = await listNativeDeepWorkflows({
+        includeCompleted,
+        status,
+        limit,
+      });
+      const active = workflows.filter((workflow) => !workflow.ready).length;
+      const ready = workflows.filter((workflow) => workflow.result_available).length;
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            workflows,
+            count: workflows.length,
+            active_count: active,
+            results_ready: ready,
+            runnable_builtin_workflows: ['deep-research'],
+            note: 'Use grok_deep_research_result with a ready workflow’s job_id to retrieve its full report.',
+          }, null, 2),
+        }],
+      };
+    } catch (error) {
+      return { content: [{ type: 'text', text: error.message }], isError: true };
+    }
+  }
 
   if (toolName === 'grok_deep_research') {
     const query = requiredText(args, 'query');

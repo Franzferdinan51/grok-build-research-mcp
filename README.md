@@ -13,6 +13,7 @@ Read-only MCP tools for LM Studio backed by the installed Grok Build CLI.
 - `grok_news_brief` — source-linked current-event briefings
 - `grok_extract_data` — structured JSON extraction
 - `grok_find_sources` — focused primary-source discovery
+- `grok_workflows` — non-blocking active/history workflow dashboard
 - `grok_quick_deep_research` — synchronous deep synthesis capped for LM Studio
 - `grok_deep_research` — start xAI's native verified background workflow
 - `grok_deep_research_status` — non-blocking phase and agent-usage status
@@ -65,6 +66,17 @@ Typical flow:
    `grok_deep_research_status` in a later turn for progress.
 3. Call `grok_deep_research_result` when the status is terminal.
 4. Call `grok_deep_research_cancel` if the work is no longer needed.
+
+`grok_workflows` is the headless MCP equivalent of Grok Build's interactive
+`/workflows` dashboard. It lists active and retained workflow runs without
+opening a TUI or waiting for them to finish. Each ready row includes the
+`job_id` LM Studio should pass to `grok_deep_research_result`.
+
+xAI currently ships one built-in workflow, `deep-research`. Custom Rhai
+workflows found under `.grok/workflows` or `~/.grok/workflows` are intentionally
+not inherited or executed by this read-only research MCP: a custom workflow can
+request capabilities outside web research. Additional native workflows can be
+added to the allowlist after their scripts receive the same read-only review.
 
 The older bounded behavior remains available as
 `grok_quick_deep_research` for callers that need the report in the current MCP

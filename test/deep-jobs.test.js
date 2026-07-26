@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
   cancelNativeDeepJob,
+  listNativeDeepWorkflows,
   nativeDeepJobResult,
   nativeDeepJobStatus,
   startNativeDeepJob,
@@ -57,6 +58,15 @@ test('native jobs persist progress and results outside an MCP request', async ()
     const result = await nativeDeepJobResult(started.job_id, directory);
     assert.equal(result.ready, true);
     assert.match(result.result, /Full persisted report/);
+    const dashboard = await listNativeDeepWorkflows({ directory });
+    assert.equal(dashboard.length, 1);
+    assert.equal(dashboard[0].ready, true);
+    assert.equal(dashboard[0].result_available, true);
+    const activeOnly = await listNativeDeepWorkflows({
+      directory,
+      includeCompleted: false,
+    });
+    assert.deepEqual(activeOnly, []);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

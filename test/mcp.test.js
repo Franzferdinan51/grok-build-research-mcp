@@ -34,6 +34,7 @@ printf 'fake grok response; model=%s\\n' "$model"
       GROK_BUILD_TIMEOUT_MS: '5000',
       GROK_BUILD_MIN_INTERVAL_MS: '0',
       GROK_BUILD_RATE_LIMIT_MAX_UNITS: '100',
+      GROK_BUILD_JOB_DIR: join(directory, 'jobs'),
     },
   });
   client = new Client({ name: 'test-client', version: '1.0.0' });
@@ -58,6 +59,7 @@ test('lists the complete read-only research tool set', async () => {
     'grok_news_brief',
     'grok_extract_data',
     'grok_find_sources',
+    'grok_workflows',
     'grok_quick_deep_research',
     'grok_deep_research',
     'grok_deep_research_status',
@@ -65,6 +67,17 @@ test('lists the complete read-only research tool set', async () => {
     'grok_deep_research_cancel',
     'grok_model_query',
   ]);
+});
+
+test('exposes a non-blocking workflow dashboard for LM Studio', async () => {
+  const result = await client.callTool({
+    name: 'grok_workflows',
+    arguments: {},
+  });
+  assert.equal(result.isError, undefined);
+  const dashboard = JSON.parse(result.content[0].text);
+  assert.deepEqual(dashboard.workflows, []);
+  assert.deepEqual(dashboard.runnable_builtin_workflows, ['deep-research']);
 });
 
 test('runs each new tool through the isolated Grok wrapper', async () => {

@@ -173,6 +173,7 @@ export async function startNativeDeepJob({
       schemaVersion: 1,
       jobId,
       status: 'queued',
+      workflowName: 'deep-research',
       query,
       breadth,
       sourcePreferences,
@@ -233,6 +234,36 @@ export async function nativeDeepJobResult(jobId, directory = nativeJobDirectory(
     ...publicJob(job, terminalStatuses.has(job.status)),
     ready: terminalStatuses.has(job.status),
   };
+}
+
+export async function listNativeDeepWorkflows({
+  directory = nativeJobDirectory(),
+  includeCompleted = true,
+  status = '',
+  limit = 20,
+} = {}) {
+  const jobs = (await listNativeJobs(directory))
+    .filter((job) => validJobId(job.jobId))
+    .sort((left, right) => (
+      Date.parse(right.createdAt || 0) - Date.parse(left.createdAt || 0)
+    ));
+  const workflows = [];
+  for (const stored of jobs) {
+    let job = stored;
+    if (activeStatuses.has(stored.status)) {
+      await nativeDeepJobStatus(stored.jobId, directory);
+      job = await readNativeJob(stored.jobId, directory);
+    }
+    if (!includeCompleted && !activeStatuses.has(job.status)) continue;
+    if (status && job.status !== status) continue;
+    workflows.push({
+      ...publicJob(job),
+      ready: terminalStatuses.has(job.status),
+      result_available: terminalStatuses.has(job.status) && job.result != null,
+    });
+    if (workflows.length >= Math.min(100, Math.max(1, limit))) break;
+  }
+  return workflows;
 }
 
 export async function cancelNativeDeepJob(jobId, directory = nativeJobDirectory()) {
