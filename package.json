@@ -1,0 +1,19 @@
+{
+  "name": "grok-build-research-mcp",
+  "version": "1.0.0",
+  "description": "Read-only Grok Build research tools for LM Studio",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Franzferdinan51/grok-build-research-mcp.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  }
+}
