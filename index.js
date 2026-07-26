@@ -11,13 +11,27 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprot
 const execFileAsync = promisify(execFile);
 const grokBin = process.env.GROK_BUILD_BIN || 'grok';
 const model = process.env.GROK_BUILD_MODEL || 'grok-build';
-const timeoutMs = Number.parseInt(process.env.GROK_BUILD_TIMEOUT_MS || '120000', 10);
+const searchModel = process.env.GROK_BUILD_SEARCH_MODEL || 'grok-build';
+const xSearchModel = process.env.GROK_BUILD_X_SEARCH_MODEL || 'grok-4-20-non-reasoning';
+const timeoutMs = Number.parseInt(process.env.GROK_BUILD_TIMEOUT_MS || '90000', 10);
 const maxConcurrent = Math.min(
   4,
   Math.max(1, Number.parseInt(process.env.GROK_BUILD_MAX_CONCURRENT || '2', 10)),
 );
 const maxDeepConcurrent = 1;
-const defaultDeepModel = process.env.GROK_BUILD_DEEP_MODEL || 'grok-4-20-multi-agent';
+const minIntervalMs = Math.max(
+  0,
+  Number.parseInt(process.env.GROK_BUILD_MIN_INTERVAL_MS || '2500', 10),
+);
+const rateLimitWindowMs = Math.max(
+  1000,
+  Number.parseInt(process.env.GROK_BUILD_RATE_LIMIT_WINDOW_MS || '300000', 10),
+);
+const maxRateLimitUnits = Math.max(
+  1,
+  Number.parseInt(process.env.GROK_BUILD_RATE_LIMIT_MAX_UNITS || '12', 10),
+);
+const defaultDeepModel = process.env.GROK_BUILD_DEEP_MODEL || searchModel;
 const allowedModels = new Set(
   (process.env.GROK_BUILD_ALLOWED_MODELS
     || 'grok-build,grok-4.5,grok-4-20-multi-agent,grok-4-20-reasoning,grok-4-20-non-reasoning')
@@ -28,6 +42,8 @@ const allowedModels = new Set(
 const maxBuffer = 8 * 1024 * 1024;
 let activeRuns = 0;
 let activeDeepRuns = 0;
+let lastRunStartedAt = 0;
+let recentRunStarts = [];
 
 function cleanOutput(value) {
   return String(value || '')
@@ -39,31 +55,51 @@ async function runGrok(prompt, options = {}) {
   const isolatedCwd = await mkdtemp(join(tmpdir(), 'lmstudio-grok-research-'));
   const selectedModel = options.model || model;
   const maxTurns = Math.min(12, Math.max(1, options.maxTurns || 8));
+  const enabledTools = options.tools || 'web_search,web_fetch';
   const args = [
     '--cwd',
     isolatedCwd,
     '--single',
     prompt,
     '--tools',
-    'web_search,web_fetch',
+    enabledTools,
+    '--always-approve',
     '--no-subagents',
     '--no-memory',
     '--max-turns',
     String(maxTurns),
     '--output-format',
     'plain',
+    '--system-prompt-override',
+    [
+      'You are a read-only research agent.',
+      'The built-in web_search and web_fetch tools are directly available when allowlisted.',
+      'Call those tools directly; never call search_tool, use_tool, or any MCP integration.',
+      'Follow the requested tool-call limit, then produce the final answer without additional searches.',
+    ].join(' '),
   ];
   if (selectedModel) args.push('--model', selectedModel);
 
   try {
     const { stdout, stderr } = await execFileAsync(grokBin, args, {
-      timeout: timeoutMs,
+      timeout: options.timeoutMs || timeoutMs,
       maxBuffer,
-      env: process.env,
+      env: {
+        ...process.env,
+        GROK_WEB_SEARCH_MODEL: options.webSearchModel
+          || process.env.GROK_WEB_SEARCH_MODEL
+          || searchModel,
+      },
     });
     const output = cleanOutput(stdout);
     if (!output) throw new Error(cleanOutput(stderr) || 'Grok Build returned no output.');
     return output;
+  } catch (error) {
+    const partialOutput = cleanOutput(error.stdout);
+    if (partialOutput) {
+      return `${partialOutput}\n\n[Stopped at the MCP latency limit; partial results returned instead of letting the host time out.]`;
+    }
+    throw error;
   } finally {
     await rm(isolatedCwd, { recursive: true, force: true });
   }
@@ -92,6 +128,32 @@ function publicUrl(value) {
 function publicUrls(value, maximum = 8) {
   if (!Array.isArray(value)) return [];
   return value.map(publicUrl).filter(Boolean).slice(0, maximum);
+}
+
+function rateLimitRetryAfter(now, cost) {
+  recentRunStarts = recentRunStarts.filter(
+    (entry) => now - entry.startedAt < rateLimitWindowMs,
+  );
+
+  const intervalRemaining = minIntervalMs - (now - lastRunStartedAt);
+  if (lastRunStartedAt && intervalRemaining > 0) return intervalRemaining;
+
+  const unitsUsed = recentRunStarts.reduce((total, entry) => total + entry.cost, 0);
+  if (unitsUsed + cost <= maxRateLimitUnits) return 0;
+
+  let unitsToExpire = unitsUsed + cost - maxRateLimitUnits;
+  for (const entry of recentRunStarts) {
+    unitsToExpire -= entry.cost;
+    if (unitsToExpire <= 0) {
+      return Math.max(1, rateLimitWindowMs - (now - entry.startedAt));
+    }
+  }
+  return rateLimitWindowMs;
+}
+
+function recordRunStart(now, cost) {
+  lastRunStartedAt = now;
+  recentRunStarts.push({ startedAt: now, cost });
 }
 
 const tools = [
@@ -232,7 +294,7 @@ const tools = [
   },
   {
     name: 'grok_deep_research',
-    description: 'Run a slower, one-at-a-time deep research pass with Grok multi-agent reasoning, primary sources, and a structured synthesis.',
+    description: 'Run a slower, one-at-a-time deep research pass with a larger turn budget, primary sources, and a structured synthesis.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -277,15 +339,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === 'grok_x_search') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
-    const maxResults = Math.min(20, Math.max(1, Number.parseInt(args.max_results, 10) || 10));
+    const maxResults = Math.min(10, Math.max(1, Number.parseInt(args.max_results, 10) || 3));
     prompt = [
-      'Research the request below with your built-in web search, prioritizing current X posts and direct x.com status URLs.',
+      'Call web_search directly exactly once for the request below.',
+      'Target site:x.com and use the indexed search results only. Do not fetch or open any result pages.',
+      'Prioritize direct x.com status URLs rather than summaries or profile pages.',
       'Distinguish verified facts from claims or reactions. Include post dates, handles, and direct links whenever available.',
       `Return no more than ${maxResults} relevant X posts, followed by a concise synthesis.`,
       optionalLine('Handles to prioritize', args.handles),
       optionalLine('Date range', args.date_range),
       `Request: ${query}`,
     ].filter(Boolean).join('\n');
+    runOptions = {
+      model: xSearchModel,
+      webSearchModel: xSearchModel,
+      tools: 'web_search',
+      maxTurns: 4,
+      timeoutMs: 50000,
+    };
   } else if (request.params.name === 'grok_web_research') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
@@ -297,6 +368,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       optionalLine('Preferred sources', args.source_preferences),
       `Request: ${query}`,
     ].filter(Boolean).join('\n');
+    runOptions = { model: searchModel };
   } else if (request.params.name === 'grok_read_url') {
     const url = publicUrl(args.url);
     if (!url) {
@@ -307,6 +379,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       optionalLine('Focus', args.focus),
       'Summarize the page faithfully, identify the publisher and date when available, preserve important claims, and note anything that cannot be verified.',
     ].filter(Boolean).join('\n');
+    runOptions = { model: searchModel };
   } else if (request.params.name === 'grok_fact_check') {
     const claim = requiredText(args, 'claim');
     if (!claim) return { content: [{ type: 'text', text: 'claim is required.' }], isError: true };
@@ -322,6 +395,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       optionalLine('Context', args.context),
       `Claim: ${claim}`,
     ].filter(Boolean).join('\n');
+    runOptions = { model: searchModel };
   } else if (request.params.name === 'grok_x_thread_reader') {
     const url = publicUrl(args.url);
     if (!url || !/^https?:\/\/(www\.)?(x|twitter)\.com\//i.test(url)) {
@@ -336,6 +410,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       optionalLine('Focus', args.focus),
       'State plainly when replies, quoted posts, or deleted content are inaccessible.',
     ].filter(Boolean).join('\n');
+    runOptions = { model: searchModel };
   } else if (request.params.name === 'grok_compare_sources') {
     const question = requiredText(args, 'question');
     const urls = publicUrls(args.urls);
@@ -350,6 +425,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       `Sources:\n${urls.map((url, index) => `${index + 1}. ${url}`).join('\n')}`,
       'Explain agreements, contradictions, evidence quality, publication dates, possible bias, and unresolved questions. Cite direct links throughout.',
     ].filter(Boolean).join('\n');
+    runOptions = { model: searchModel };
   } else if (request.params.name === 'grok_news_brief') {
     const topic = requiredText(args, 'topic');
     if (!topic) return { content: [{ type: 'text', text: 'topic is required.' }], isError: true };
@@ -361,6 +437,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       optionalLine('Region', args.region),
       'Include: bottom line, timestamped timeline, key actors, confirmed facts, disputed claims, what to watch next, and direct source links.',
     ].filter(Boolean).join('\n');
+    runOptions = { model: searchModel };
   } else if (request.params.name === 'grok_extract_data') {
     const extractionRequest = requiredText(args, 'request');
     const fields = Array.isArray(args.fields)
@@ -379,6 +456,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       urls.length ? `Source URLs:\n${urls.join('\n')}` : '',
       'Return a JSON array of objects. Use null for unavailable values and include a source_url field for provenance.',
     ].filter(Boolean).join('\n');
+    runOptions = { model: searchModel };
   } else if (request.params.name === 'grok_find_sources') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
@@ -390,6 +468,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       `Request: ${query}`,
       'Return a numbered list containing title, publisher, date, direct URL, source type, and one sentence explaining relevance. Do not write a general essay.',
     ].filter(Boolean).join('\n');
+    runOptions = { model: searchModel };
   } else if (request.params.name === 'grok_deep_research') {
     const query = requiredText(args, 'query');
     if (!query) return { content: [{ type: 'text', text: 'query is required.' }], isError: true };
@@ -447,6 +526,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 
+  const rateLimitCost = isDeep ? 3 : 1;
+  const now = Date.now();
+  const retryAfterMs = rateLimitRetryAfter(now, rateLimitCost);
+  if (retryAfterMs > 0) {
+    return {
+      content: [{
+        type: 'text',
+        text: `Grok Build rate limit is protecting the API plan. No CLI process was started. Retry after ${Math.ceil(retryAfterMs / 1000)} seconds.`,
+      }],
+      isError: true,
+    };
+  }
+
+  recordRunStart(now, rateLimitCost);
   activeRuns += 1;
   if (isDeep) activeDeepRuns += 1;
   try {

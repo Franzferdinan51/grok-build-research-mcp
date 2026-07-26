@@ -15,7 +15,12 @@ test.before(async () => {
   const fakeGrok = join(directory, 'grok');
   await writeFile(fakeGrok, `#!/bin/sh
 sleep 0.1
-printf '%s\\n' "$@" | grep -q -- '--model' && model=yes || model=no
+model=""
+previous=""
+for argument in "$@"; do
+  if [ "$previous" = "--model" ]; then model="$argument"; break; fi
+  previous="$argument"
+done
 printf 'fake grok response; model=%s\\n' "$model"
 `);
   await chmod(fakeGrok, 0o755);
@@ -27,6 +32,8 @@ printf 'fake grok response; model=%s\\n' "$model"
       ...process.env,
       GROK_BUILD_BIN: fakeGrok,
       GROK_BUILD_TIMEOUT_MS: '5000',
+      GROK_BUILD_MIN_INTERVAL_MS: '0',
+      GROK_BUILD_RATE_LIMIT_MAX_UNITS: '100',
     },
   });
   client = new Client({ name: 'test-client', version: '1.0.0' });
@@ -90,6 +97,20 @@ test('rejects invalid URLs and unapproved models before spawning Grok', async ()
   assert.match(badModel.content[0].text, /not approved/);
 });
 
+test('routes X search to the fast model and tool-free queries to Grok Build', async () => {
+  const search = await client.callTool({
+    name: 'grok_x_search',
+    arguments: { query: 'routing test' },
+  });
+  assert.match(search.content[0].text, /model=grok-4-20-non-reasoning/);
+
+  const query = await client.callTool({
+    name: 'grok_model_query',
+    arguments: { prompt: 'routing test' },
+  });
+  assert.match(query.content[0].text, /model=grok-build/);
+});
+
 test('allows only one deep or multi-agent request at a time', async () => {
   const first = client.callTool({
     name: 'grok_deep_research',
@@ -106,4 +127,34 @@ test('allows only one deep or multi-agent request at a time', async () => {
     results.find((result) => result.isError === true).content[0].text,
     /already running/,
   );
+});
+
+test('rate-limits excess requests without spawning Grok', async () => {
+  const limitedTransport = new StdioClientTransport({
+    command: process.execPath,
+    args: [join(process.cwd(), 'index.js')],
+    env: {
+      ...process.env,
+      GROK_BUILD_BIN: join(directory, 'grok'),
+      GROK_BUILD_TIMEOUT_MS: '5000',
+      GROK_BUILD_MIN_INTERVAL_MS: '0',
+      GROK_BUILD_RATE_LIMIT_WINDOW_MS: '60000',
+      GROK_BUILD_RATE_LIMIT_MAX_UNITS: '2',
+    },
+  });
+  const limitedClient = new Client({ name: 'rate-limit-client', version: '1.0.0' });
+  await limitedClient.connect(limitedTransport);
+  try {
+    await limitedClient.callTool({ name: 'grok_web_research', arguments: { query: 'one' } });
+    await limitedClient.callTool({ name: 'grok_web_research', arguments: { query: 'two' } });
+    const third = await limitedClient.callTool({
+      name: 'grok_web_research',
+      arguments: { query: 'three' },
+    });
+    assert.equal(third.isError, true);
+    assert.match(third.content[0].text, /protecting the API plan/);
+    assert.match(third.content[0].text, /Retry after/);
+  } finally {
+    await limitedClient.close();
+  }
 });
